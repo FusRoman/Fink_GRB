@@ -4,14 +4,18 @@ from fink_grb.utils.fun_utils import return_verbose_level
 warnings.filterwarnings("ignore")
 
 import pandas as pd  # noqa: F401
+import numpy as np
 import time
 import os
 import subprocess
 import sys
+import healpy as hp
 
 from pyspark.sql import functions as F
+from pyspark.sql.functions import pandas_udf, explode, col
+from pyspark.sql.types import IntegerType, ArrayType
 
-from fink_utils.science.utils import ang2pix
+from fink_utils.science.utils import ang2pix, ra2phi, dec2theta
 from fink_utils.spark.partitioning import convert_to_datetime
 from fink_utils.broker.sparkUtils import init_sparksession, connect_to_raw_database
 
@@ -42,7 +46,7 @@ def ztf_grb_filter(spark_ztf):
     >>> spark_filter = ztf_grb_filter(sparkDF)
 
     >>> spark_filter.count()
-    47
+    31
     """
     spark_filter = (
         spark_ztf.filter(
@@ -54,18 +58,66 @@ def ztf_grb_filter(spark_ztf):
         .filter(
             (spark_ztf.candidate.distpsnr1 > 2)
             | (
-                spark_ztf.candidate.ssdistnr == -999.0
+                spark_ztf.candidate.distpsnr1 == -999.0
             )  # distance of closest source from Pan-Starrs 1 catalog above 30 arcsecond
         )
         .filter(
             (spark_ztf.candidate.neargaia > 5)
             | (
-                spark_ztf.candidate.ssdistnr == -999.0
+                spark_ztf.candidate.neargaia == -999.0
             )  # distance of closest source from Gaia DR1 catalog above 60 arcsecond
         )
     )
 
     return spark_filter
+
+
+@pandas_udf(ArrayType(IntegerType()))
+def box2pixs(ra, dec, radius, NSIDE):
+    """
+    Return all the pixels from a healpix map with NSIDE
+    overlapping the given area defined by the center ra, dec and the radius.
+
+    Parameters
+    ----------
+    ra : pd.Series
+        right ascension columns
+    dec : pd.Series
+        declination columns
+    radius : pd.Series
+        error radius of the high energy events, must be in degrees
+    NSIDE : pd.Series
+        pixels size of the healpix map
+
+    Return
+    ------
+    ipix_disc : pd.Series
+        columns of array containing all the pixel numbers overlapping the error area.
+
+    Examples
+    --------
+    >>> spark_grb = spark.read.format('parquet').load(grb_data)
+    >>> NSIDE = 4
+
+    >>> spark_grb = spark_grb.withColumn(
+    ... "err_degree", spark_grb["err_arcmin"] / 60
+    ... )
+    >>> spark_grb = spark_grb.withColumn("hpix_circle", box2pixs(
+    ...     spark_grb.ra, spark_grb.dec, spark_grb.err_degree, F.lit(NSIDE)
+    ... ))
+
+    >>> spark_grb.withColumn("hpix", explode("hpix_circle"))\
+            .orderBy("hpix")\
+                .select(["triggerId", "hpix"]).head(5)
+    [Row(triggerId=683499781, hpix=10), Row(triggerId=683499781, hpix=20), Row(triggerId=683499781, hpix=21), Row(triggerId=683499781, hpix=22), Row(triggerId=683499781, hpix=35)]
+    """
+    theta, phi = dec2theta(dec.values), ra2phi(ra.values)
+    vec = hp.ang2vec(theta, phi)
+    ipix_disc = [
+        hp.query_disc(nside=n, vec=v, radius=np.radians(r))
+        for n, v, r in zip(NSIDE.values, vec, radius.values)
+    ]
+    return pd.Series(ipix_disc)
 
 
 def ztf_join_gcn_stream(
@@ -114,8 +166,8 @@ def ztf_join_gcn_stream(
     ... 5
     ... )
 
-    >>> datatest = pd.read_parquet("fink_grb/test/test_data/grb_join_output.parquet")
-    >>> datajoin = pd.read_parquet(grb_dataoutput + "/grb/year=2019")
+    >>> datatest = pd.read_parquet("fink_grb/test/test_data/grb_join_output.parquet").sort_values(["objectId", "triggerId", "grb_ra"]).reset_index(drop=True)
+    >>> datajoin = pd.read_parquet(grb_dataoutput + "/grb/year=2019").sort_values(["objectId", "triggerId", "grb_ra"]).reset_index(drop=True)
 
     >>> assert_frame_equal(datatest, datajoin, check_dtype=False, check_column_type=False, check_categorical=False)
 
@@ -164,17 +216,36 @@ def ztf_join_gcn_stream(
     )
 
     df_grb_stream = df_grb_stream.withColumn(
-        "hpix", ang2pix(df_grb_stream.ra, df_grb_stream.dec, F.lit(NSIDE))
+        "err_degree", df_grb_stream["err_arcmin"] / 60
     )
+    df_grb_stream = df_grb_stream.withColumn(
+        "hpix_circle",
+        box2pixs(
+            df_grb_stream.ra, df_grb_stream.dec, df_grb_stream.err_degree, F.lit(NSIDE)
+        ),
+    )
+    df_grb_stream = df_grb_stream.withColumn("hpix", explode("hpix_circle"))
 
     if logs:  # pragma: no cover
         logger.info("Healpix columns computing successfull")
+
+    df_ztf_stream = df_ztf_stream.withColumn("ztf_ra", col("candidate.ra")).withColumn(
+        "ztf_dec", col("candidate.dec")
+    )
+
+    df_grb_stream = df_grb_stream.withColumnRenamed("ra", "grb_ra").withColumnRenamed(
+        "dec", "grb_dec"
+    )
 
     # join the two streams according to the healpix columns.
     # A pixel id will be assign to each alerts / gcn according to their position in the sky.
     # Each alerts / gcn with the same pixel id are in the same area of the sky.
     # The NSIDE correspond to a resolution of ~15 degree/pixel.
 
+    # WARNING  !
+    # the join condition with healpix column doesn't work properly
+    # have to take into account the nearby pixels in case the error box of a GRB
+    # overlap many pixels.
     join_condition = [
         df_ztf_stream.hpix == df_grb_stream.hpix,
         df_ztf_stream.candidate.jdstarthist > df_grb_stream.triggerTimejd,
@@ -247,8 +318,8 @@ def launch_joining_stream(arguments):
     ... "--exit_after" : 90
     ... })
 
-    >>> datatest = pd.read_parquet("fink_grb/test/test_data/grb_join_output.parquet")
-    >>> datajoin = pd.read_parquet(grb_datatest + "/grb/year=2019")
+    >>> datatest = pd.read_parquet("fink_grb/test/test_data/grb_join_output.parquet").sort_values(["objectId", "triggerId", "grb_ra"]).reset_index(drop=True)
+    >>> datajoin = pd.read_parquet(grb_datatest + "/grb/year=2019").sort_values(["objectId", "triggerId", "grb_ra"]).reset_index(drop=True)
 
     >>> assert_frame_equal(datatest, datajoin, check_dtype=False, check_column_type=False, check_categorical=False)
 
@@ -374,10 +445,12 @@ if __name__ == "__main__":
 
         globs = globals()
 
+        grb_data = "fink_grb/test/test_data/gcn_test/raw/year=2019/month=09/day=03"
         join_data = "fink_grb/test/test_data/join_raw_datatest.parquet"
         alert_data = "fink_grb/test/test_data/ztf_test/online/science/year=2019/month=09/day=03/ztf_science_test.parquet"
         globs["join_data"] = join_data
         globs["alert_data"] = alert_data
+        globs["grb_data"] = grb_data
 
         # Run the test suite
         spark_unit_tests_science(globs)

@@ -149,6 +149,7 @@ def grb_assoc(
         grb error radius (in arcminute)
 
     Returns
+    -------
     grb_proba : pandas Series
         the serendipitous probability for each ztf alerts.
 
